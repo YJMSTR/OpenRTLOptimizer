@@ -88,149 +88,172 @@ class MultimodalRAG:
                 
         return data
 
-    def load_model(self):
-        """Load the retriever, reranker, and vision-language models."""
+    def load_retriever_model(self):
+        """Load the retriever model."""
+        if self.retriever_model is not None:
+            return True
         try:
             start_time = time.time()
-            print("[MODEL] Starting model or index loading...")
+            print("[MODEL] Starting retriever model or index loading...")
             
-            if self.retriever_model is None:
-                if os.path.exists(os.path.join(self.index_root, self.index_name)):
-                    print(f"[MODEL] Found existing index: {self.index_name}")
-                    print(f"[MODEL] Loading index, this may take a few minutes...")
-                    self.retriever_model = RAGMultiModalModel.from_index(
-                        self.index_name,
-                        index_root=self.index_root
-                    )
-                    print(f"[MODEL] Index loading complete!")
-                else:
-                    print(f"[MODEL] No existing index found, loading model: {self.retriever_model_path}")
-                    print(f"[MODEL] This may take a few minutes depending on model size and hardware...")
-                    self.retriever_model = RAGMultiModalModel.from_pretrained(
-                        self.retriever_model_path,
-                        index_root=self.index_root
-                    )
-                    print(f"[MODEL] Retriever Model loading complete!")
-                
-            if self.reranker_model is None:
-                print(f"[MODEL] Loading reranker model from: {self.reranker_model_path}")
-                self.reranker_model = Reranker(self.reranker_model_path)
-                print(f"[MODEL] Reranker model loading complete!")
-
-            if self.vl_model is None:
-                print(f"[MODEL] Loading VL model from: {self.vl_model_path}")
-                model_path = self.vl_model_path
-                
-                # LLM config preparing
-                llm_config = Qwen2Config.from_json_file(os.path.join(model_path, "llm_config.json"))
-                llm_config.qk_norm = True
-                llm_config.tie_word_embeddings = False
-                llm_config.layer_module = "Qwen2MoTDecoderLayer"
-
-                # ViT config preparing
-                vit_config = SiglipVisionConfig.from_json_file(os.path.join(model_path, "vit_config.json"))
-                vit_config.rope = False
-                vit_config.num_hidden_layers = vit_config.num_hidden_layers - 1
-
-                # VAE loading
-                print(f"[MODEL] Loading VAE model from: {os.path.join(model_path, 'ae.safetensors')}")
-                vae_model, vae_config = load_ae(local_path=os.path.join(model_path, "ae.safetensors"))
-                vae_model.to(dtype=torch.bfloat16)
-                print(f"[MODEL] VAE model loading complete!")
-
-                # Bagel config preparing
-                config = BagelConfig(
-                    visual_gen=True,
-                    visual_und=True,
-                    llm_config=llm_config, 
-                    vit_config=vit_config,
-                    vae_config=vae_config,
-                    vit_max_num_patch_per_side=70,
-                    connector_act='gelu_pytorch_tanh',
-                    latent_patch_size=2,
-                    max_latent_size=64,
+            if os.path.exists(os.path.join(self.index_root, self.index_name)):
+                print(f"[MODEL] Found existing index: {self.index_name}")
+                print(f"[MODEL] Loading index, this may take a few minutes...")
+                self.retriever_model = RAGMultiModalModel.from_index(
+                    self.index_name,
+                    index_root=self.index_root
                 )
-
-                with init_empty_weights():
-                    language_model = Qwen2ForCausalLM(llm_config)
-                    vit_model      = SiglipVisionModel(vit_config)
-                    model          = Bagel(language_model, vit_model, config)
-                    model.vit_model.vision_model.embeddings.convert_conv2d_to_linear(vit_config, meta=True)
-
-                print(f"[MODEL] init_empty_weights complete!")
-
-                # Tokenizer Preparing
-                tokenizer = Qwen2Tokenizer.from_pretrained(model_path)
-                tokenizer, new_token_ids, _ = add_special_tokens(tokenizer)
-
-                # Image Transform Preparing
-                vae_transform = ImageTransform(1024, 512, 16)
-                vit_transform = ImageTransform(980, 224, 14)
-                
-                max_mem_per_gpu = "16GiB"  # Modify it according to your GPU setting. On an A100, 80 GiB is sufficient to load on a single GPU.
-
-                device_map = infer_auto_device_map(
-                    model,
-                    max_memory={i: max_mem_per_gpu for i in range(torch.cuda.device_count())},
-                    no_split_module_classes=["Bagel", "Qwen2MoTDecoderLayer"],
+                print(f"[MODEL] Index loading complete!")
+            else:
+                print(f"[MODEL] No existing index found, loading model: {self.retriever_model_path}")
+                print(f"[MODEL] This may take a few minutes depending on model size and hardware...")
+                self.retriever_model = RAGMultiModalModel.from_pretrained(
+                    self.retriever_model_path,
+                    index_root=self.index_root
                 )
-                print(device_map)
-
-                same_device_modules = [
-                    'language_model.model.embed_tokens',
-                    'time_embedder',
-                    'latent_pos_embed',
-                    'vae2llm',
-                    'llm2vae',
-                    'connector',
-                    'vit_pos_embed'
-                ]
-
-                if torch.cuda.device_count() == 1:
-                    first_device = device_map.get(same_device_modules[0], "cuda:0")
-                    for k in same_device_modules:
-                        if k in device_map:
-                            device_map[k] = first_device
-                        else:
-                            device_map[k] = "cuda:0"
-                else:
-                    first_device = device_map.get(same_device_modules[0])
-                    for k in same_device_modules:
-                        if k in device_map:
-                            device_map[k] = first_device
-                
-                model = load_checkpoint_and_dispatch(
-                    model,
-                    checkpoint=os.path.join(model_path, "ema.safetensors"),
-                    device_map=device_map,
-                    offload_buffers=True,
-                    dtype=torch.bfloat16,
-                    force_hooks=True,
-                    offload_folder="/tmp/offload"
-                )
-                print(f"[MODEL] VL model checkpoint loading complete!")
-
-                model = model.eval()
-                
-                inferencer = InterleaveInferencer(
-                    model=model, 
-                    vae_model=vae_model, 
-                    tokenizer=tokenizer, 
-                    vae_transform=vae_transform, 
-                    vit_transform=vit_transform, 
-                    new_token_ids=new_token_ids
-                )
-                self.vl_model = inferencer
-                print("[MODEL] VL model loading complete!")
+                print(f"[MODEL] Retriever Model loading complete!")
             
             elapsed_time = time.time() - start_time
-            print(f"[MODEL] Model loading complete! Time elapsed: {elapsed_time:.2f} seconds")
+            print(f"[MODEL] Retriever model loading complete! Time elapsed: {elapsed_time:.2f} seconds")
             return True
         except Exception as e:
-            print(f"[ERROR] Failed to load model: {e}")
+            print(f"[ERROR] Failed to load retriever model: {e}")
             return False
-        
-    
+
+    def load_reranker_model(self):
+        """Load the reranker model."""
+        if self.reranker_model is not None:
+            return True
+        try:
+            start_time = time.time()
+            print(f"[MODEL] Loading reranker model from: {self.reranker_model_path}")
+            self.reranker_model = Reranker(self.reranker_model_path)
+            print(f"[MODEL] Reranker model loading complete!")
+            elapsed_time = time.time() - start_time
+            print(f"[MODEL] Reranker model loading complete! Time elapsed: {elapsed_time:.2f} seconds")
+            return True
+        except Exception as e:
+            print(f"[ERROR] Failed to load reranker model: {e}")
+            return False
+
+    def load_vl_model(self):
+        """Load the vision-language model."""
+        if self.vl_model is not None:
+            return True
+        try:
+            start_time = time.time()
+            print(f"[MODEL] Loading VL model from: {self.vl_model_path}")
+            model_path = self.vl_model_path
+            
+            # LLM config preparing
+            llm_config = Qwen2Config.from_json_file(os.path.join(model_path, "llm_config.json"))
+            llm_config.qk_norm = True
+            llm_config.tie_word_embeddings = False
+            llm_config.layer_module = "Qwen2MoTDecoderLayer"
+
+            # ViT config preparing
+            vit_config = SiglipVisionConfig.from_json_file(os.path.join(model_path, "vit_config.json"))
+            vit_config.rope = False
+            vit_config.num_hidden_layers = vit_config.num_hidden_layers - 1
+
+            # VAE loading
+            print(f"[MODEL] Loading VAE model from: {os.path.join(model_path, 'ae.safetensors')}")
+            vae_model, vae_config = load_ae(local_path=os.path.join(model_path, "ae.safetensors"))
+            vae_model.to(dtype=torch.bfloat16)
+            print(f"[MODEL] VAE model loading complete!")
+
+            # Bagel config preparing
+            config = BagelConfig(
+                visual_gen=True,
+                visual_und=True,
+                llm_config=llm_config, 
+                vit_config=vit_config,
+                vae_config=vae_config,
+                vit_max_num_patch_per_side=70,
+                connector_act='gelu_pytorch_tanh',
+                latent_patch_size=2,
+                max_latent_size=64,
+            )
+
+            with init_empty_weights():
+                language_model = Qwen2ForCausalLM(llm_config)
+                vit_model      = SiglipVisionModel(vit_config)
+                model          = Bagel(language_model, vit_model, config)
+                model.vit_model.vision_model.embeddings.convert_conv2d_to_linear(vit_config, meta=True)
+
+            print(f"[MODEL] init_empty_weights complete!")
+
+            # Tokenizer Preparing
+            tokenizer = Qwen2Tokenizer.from_pretrained(model_path)
+            tokenizer, new_token_ids, _ = add_special_tokens(tokenizer)
+
+            # Image Transform Preparing
+            vae_transform = ImageTransform(1024, 512, 16)
+            vit_transform = ImageTransform(980, 224, 14)
+            
+            max_mem_per_gpu = "24GiB"  # Modify it according to your GPU setting. On an A100, 80 GiB is sufficient to load on a single GPU.
+
+            device_map = infer_auto_device_map(
+                model,
+                max_memory={i: max_mem_per_gpu for i in range(torch.cuda.device_count())},
+                no_split_module_classes=["Bagel", "Qwen2MoTDecoderLayer"],
+            )
+            print(device_map)
+
+            same_device_modules = [
+                'language_model.model.embed_tokens',
+                'time_embedder',
+                'latent_pos_embed',
+                'vae2llm',
+                'llm2vae',
+                'connector',
+                'vit_pos_embed'
+            ]
+
+            if torch.cuda.device_count() == 1:
+                first_device = device_map.get(same_device_modules[0], "cuda:0")
+                for k in same_device_modules:
+                    if k in device_map:
+                        device_map[k] = first_device
+                    else:
+                        device_map[k] = "cuda:0"
+            else:
+                first_device = device_map.get(same_device_modules[0])
+                for k in same_device_modules:
+                    if k in device_map:
+                        device_map[k] = first_device
+            
+            model = load_checkpoint_and_dispatch(
+                model,
+                checkpoint=os.path.join(model_path, "ema.safetensors"),
+                device_map=device_map,
+                offload_buffers=True,
+                dtype=torch.bfloat16,
+                force_hooks=True,
+                offload_folder="/tmp/offload"
+            )
+            print(f"[MODEL] VL model checkpoint loading complete!")
+
+            model = model.eval()
+            
+            inferencer = InterleaveInferencer(
+                model=model, 
+                vae_model=vae_model, 
+                tokenizer=tokenizer, 
+                vae_transform=vae_transform, 
+                vit_transform=vit_transform, 
+                new_token_ids=new_token_ids
+            )
+            self.vl_model = inferencer
+            print("[MODEL] VL model loading complete!")
+            
+            elapsed_time = time.time() - start_time
+            print(f"[MODEL] VL model loading complete! Time elapsed: {elapsed_time:.2f} seconds")
+            return True
+        except Exception as e:
+            print(f"[ERROR] Failed to load VL model: {e}")
+            return False
+
     def create_index(self, input_path: str, store_collection_with_index: bool = False, overwrite: bool = False):
         """
         Create an index for the documents in the input path.
@@ -242,7 +265,7 @@ class MultimodalRAG:
         """
         if self.retriever_model is None:
             print("[INDEX] Retriever model not loaded, attempting to load model...")
-            if not self.load_model():
+            if not self.load_retriever_model():
                 return False
         
         # We need tempfile for the clean directory approach
@@ -327,7 +350,7 @@ class MultimodalRAG:
         """
         if self.retriever_model is None:
             print("[SEARCH] Model not loaded, attempting to load model...")
-            if not self.load_model():
+            if not self.load_retriever_model():
                 return []
         
         try:
@@ -359,7 +382,7 @@ class MultimodalRAG:
         """
         if self.reranker_model is None:
             print("[RERANK] Reranker model not loaded, attempting to load model...")
-            if not self.load_model():
+            if not self.load_reranker_model():
                 return []
                 
         try:
@@ -445,13 +468,62 @@ class MultimodalRAG:
             print(f"[ERROR] Reranking failed: {e}")
             return []
 
+    def generate_answer_from_images(self, images: List[Image.Image], prompt: str):
+        """
+        Generate an answer using the Vision-Language model with multiple images.
+        """
+        if self.vl_model is None:
+            print("[VLMODEL] Vision-Language model not loaded, attempting to load model...")
+            if not self.load_vl_model():
+                return "Failed to load VL model."
+
+        try:
+            start_time = time.time()
+
+            # The user's query is the main prompt. We append image placeholders.
+            # The prompt format `A man <img><|image_1|></img> and a woman <img><|image_2|></img>...`
+            # suggests placeholders can be interleaved. A simple approach is to append them.
+            image_placeholders = " ".join([f"<img><|image_{i+1}|></img>" for i in range(len(images))])
+            prompt_with_placeholders = f"{prompt} {image_placeholders}"
+
+            print(f"[VLMODEL] Generating answer for prompt: \"{prompt}\" with {len(images)} images.")
+            
+            # Create the input list for interleave_inference
+            input_list = images + [prompt_with_placeholders]
+
+            inference_hyper = dict(
+                max_think_token_n=1000,
+                do_sample=False,
+            )
+            
+            # Use interleave_inference for multi-image input
+            # This is based on Bagel's multi-image inference capability.
+            output_dict = self.vl_model.interleave_inference(input_lists=input_list, understanding_output=True, **inference_hyper)
+            
+            answer = ""
+            # The output of interleave_inference is a list, where text is one of the items.
+            if isinstance(output_dict, list):
+                text_outputs = [item for item in output_dict if isinstance(item, str)]
+                if text_outputs:
+                    answer = "\n".join(text_outputs)
+
+            elapsed_time = time.time() - start_time
+            print(f"[VLMODEL] Answer generation completed! Time elapsed: {elapsed_time:.2f} seconds")
+            
+            return answer
+        except Exception as e:
+            print(f"[ERROR] Answer generation failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return f"Error during answer generation: {e}"
+
     def generate_answer(self, image: Image.Image, prompt: str):
         """
         Generate an answer using the Vision-Language model.
         """
         if self.vl_model is None:
             print("[VLMODEL] Vision-Language model not loaded, attempting to load model...")
-            if not self.load_model():
+            if not self.load_vl_model():
                 return "Failed to load VL model."
 
         try:
@@ -476,6 +548,37 @@ class MultimodalRAG:
         except Exception as e:
             print(f"[ERROR] Answer generation failed: {e}")
             return f"Error during answer generation: {e}"
+
+    def unload_retriever_model(self):
+        if self.retriever_model:
+            print("[MODEL] Unloading retriever model...")
+            del self.retriever_model
+            self.retriever_model = None
+            torch.cuda.empty_cache()
+            print("[MODEL] Retriever model unloaded.")
+
+    def unload_reranker_model(self):
+        if self.reranker_model:
+            print("[MODEL] Unloading reranker model...")
+            # Move model to CPU before deleting to free GPU memory
+            if hasattr(self.reranker_model, 'model'):
+                self.reranker_model.model.to('cpu')
+            del self.reranker_model
+            self.reranker_model = None
+            torch.cuda.empty_cache()
+            print("[MODEL] Reranker model unloaded.")
+
+    def unload_vl_model(self):
+        if self.vl_model:
+            print("[MODEL] Unloading VL model...")
+            # Move model to CPU before deleting to free GPU memory
+            if hasattr(self.vl_model, 'model'):
+                self.vl_model.model.to('cpu')
+            del self.vl_model
+            self.vl_model = None
+            torch.cuda.empty_cache()
+            print("[MODEL] VL model unloaded.")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Retrieve documents using ColQwen2 model')
@@ -503,12 +606,16 @@ if __name__ == "__main__":
     )
     
     if args.task == 'create_index':
+        rag.load_retriever_model()
         rag.create_index(args.input_path, overwrite=args.overwrite)
+        rag.unload_retriever_model()
     elif args.task == 'search':
         if not args.query:
             print("Please provide a query for searching.")
         else:
+            rag.load_retriever_model()
             results = rag.search(args.query, k=args.k)
+            rag.unload_retriever_model()
             print("Search results:")
             for res in results:
                 print(f" Doc_id: {res.doc_id}: (Score: {res.score})")
@@ -516,8 +623,13 @@ if __name__ == "__main__":
         if not args.query:
             print("Please provide a query for reranking.")
         else:
+            rag.load_retriever_model()
             search_results = rag.search(args.query, k=10) 
+            rag.unload_retriever_model()
+
+            rag.load_reranker_model()
             reranked_results = rag.rerank(args.query, search_results, k=args.k)
+            rag.unload_reranker_model()
             print("Reranked results:")
             for res in reranked_results:
                 if res.get('original_data'):
@@ -529,13 +641,17 @@ if __name__ == "__main__":
             print("Please provide a query for answer generation.")
         else:
             print("[GENERATE_ANSWER] Searching for relevant documents...")
+            rag.load_retriever_model()
             search_results = rag.search(args.query, k=10)
+            rag.unload_retriever_model()
             
             if not search_results:
                 print("[GENERATE_ANSWER] No documents found for the query.")
             else:
                 print("[GENERATE_ANSWER] Reranking search results to find the best image...")
-                reranked_results = rag.rerank(args.query, search_results, k=1)
+                rag.load_reranker_model()
+                reranked_results = rag.rerank(args.query, search_results, k=args.k)
+                rag.unload_reranker_model()
                 
                 if not reranked_results:
                     print("[GENERATE_ANSWER] Reranking failed or returned no results.")
@@ -547,11 +663,31 @@ if __name__ == "__main__":
                         print("[GENERATE_ANSWER] Reranking did not yield a valid image name.")
                     else:
                         try:
-                            image_path = os.path.join(rag.image_path, image_name)
-                            print(f"[GENERATE_ANSWER] Using image '{image_name}' for answer generation.")
-                            image = Image.open(image_path)
+                            rag.load_vl_model()
                             
-                            answer = rag.generate_answer(image, args.query)
+                            # For single image generation, use the top result
+                            if args.k == 1:
+                                image_path = os.path.join(rag.image_path, image_name)
+                                print(f"[GENERATE_ANSWER] Using image '{image_name}' for answer generation.")
+                                image = Image.open(image_path)
+                                answer = rag.generate_answer(image, args.query)
+                            else: # For multi-image generation
+                                images_to_use = []
+                                image_names = []
+                                for res in reranked_results:
+                                    img_name = res.get('image_name')
+                                    if img_name and img_name != "N/A":
+                                        image_path = os.path.join(rag.image_path, img_name)
+                                        images_to_use.append(Image.open(image_path))
+                                        image_names.append(img_name)
+                                
+                                if images_to_use:
+                                    print(f"[GENERATE_ANSWER] Using {len(images_to_use)} images for answer generation: {image_names}")
+                                    answer = rag.generate_answer_from_images(images_to_use, args.query)
+                                else:
+                                    answer = "[GENERATE_ANSWER] No valid images found in reranked results to generate an answer."
+
+                            rag.unload_vl_model()
                             print("\n--- Generated Answer ---")
                             print(answer)
                             print("------------------------")
@@ -570,5 +706,8 @@ if __name__ == "__main__":
     # 3. Rerank:
     # python main.py --task rerank --query "How to optimize LUT?" --input_path ../index/rtl_optimize_rules/ --k 3
     #
-    # 4. Generate Answer:
-    # python main.py --task generate_answer --query "How to optimize this circuit?" --image_path ../data/rtl_optimize_rules/image/d36_1.png --input_path ../data/rtl_optimize_rules/
+    # 4. Generate Answer (single image):
+    # python main.py --task generate_answer --query "How to optimize this circuit?" --k 1
+    #
+    # 5. Generate Answer (multiple images):
+    # python main.py --task generate_answer --query "How to optimize this circuit based on these images?" --k 3
