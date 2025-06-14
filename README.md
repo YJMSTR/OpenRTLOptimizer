@@ -1,5 +1,6 @@
 Use part of AMD UG949, AMD UG901 and some AI-gen optimize rules as knowledge base.
 
+Test on 4090 24G x 4
 
 ```bash
 pip install -r requirements.txt
