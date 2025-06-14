@@ -2,6 +2,7 @@ Use part of AMD UG949, AMD UG901 and some AI-gen optimize rules as knowledge bas
 
 Test on 4090 24G x 4
 
+
 ```bash
 pip install -r requirements.txt
 
@@ -106,3 +107,7 @@ Example output:
 >   - Utilize design optimization tools provided by the synthesis suite (e.g., Vivado) to automatically optimize the design for area reduction. These tools can help in identifying and implementing the most efficient design.
 >
 >By applying these strategies, you can effectively decrease the area of the chip while maintaining or improving its performance.
+
+Colpali-Engine needs a torch>=2.5.0 & < 2.7.0
+Install torch first. Then install vllm by `uv pip install vllm --torch-backend=auto`. After that, install flash-attn with by `pip install flash-attn --no-build-isolation`.
+

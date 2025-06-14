@@ -313,9 +313,14 @@ class MultimodalRAG:
                 print(f"[INDEX] Reloading model to ensure clean state...")
                 self.retriever_model = RAGMultiModalModel.from_pretrained(
                     self.retriever_model_path,
-                    index_root=self.index_root,
-                    device_map={'': self.retriever_device}
+                    index_root=self.index_root
                 )
+                if hasattr(self.retriever_model, 'model') and self.retriever_model.model is not None:
+                    if hasattr(self.retriever_model.model, 'model'):
+                        self.retriever_model.model.model.to(self.retriever_device)
+                        print(f"[MODEL] Retriever model's internal torch model moved to {self.retriever_device} after reloading.")
+                    else:
+                        print("[WARN] Could not find an internal '.model' attribute on the reloaded ColPaliModel to move to a specific device.")
             
             input_path_obj = pathlib.Path(input_path + '/image/')
 
@@ -632,7 +637,7 @@ if __name__ == "__main__":
     parser.add_argument('--reranker_model_path', type=str, default='../models/MonoQwen2-VL-v0.1', help='Path to the reranker model')
     parser.add_argument('--vl_model_path', type=str, default='../models/BAGEL-7B-MoT', help='Path to the Vision-Language model')
     parser.add_argument('--input_path', type=str, default='../data/', help='Path to the directory containing documents or a single document file')
-    # parser.add_argument('--query', type=str, help='Query to search for')
+    parser.add_argument('--query', type=str, help='Query to search for')
     parser.add_argument('--image_path', type=str, default='../data/image/', help='Path to an image file for context')
     parser.add_argument('--task', type=str, choices=['create_index', 'search', 'rerank', 'generate_answer'], default='search', help='Task to perform')
     parser.add_argument('--k', type=int, default=5, help='Number of documents to retrieve')
@@ -792,7 +797,7 @@ if __name__ == "__main__":
     # python main.py --task rerank --query "How to optimize LUT?"  --k 3
     #
     # 4. Generate Answer (single image):
-    # python main.py --task generate_answer  --k 1
+    # python main.py --task generate_answer --query "How to improve frequency?" --k 1
     #
     # 5. Generate Answer (multiple images):
-    # python main.py --task generate_answer --k 3
+    # python main.py --task generate_answer --query "How to improve frequency?" --k 3
