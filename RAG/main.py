@@ -46,6 +46,22 @@ class MultimodalRAG:
         self.reranker_model = None
         self.vl_model = None
 
+        # --- GPU Allocation Strategy ---
+        if torch.cuda.device_count() >= 4:
+            print("[INIT] Applying 4-GPU allocation strategy.")
+            self.retriever_device = "cuda:0"
+            self.reranker_device = "cuda:0" # Shares GPU with retriever
+            self.vl_gpus = [1, 2, 3] # Use GPUs 1, 2, 3 for the large VL model
+            self.vl_main_device = f"cuda:{self.vl_gpus[0]}"
+        else:
+            # Fallback for systems with fewer than 4 GPUs
+            print("[INIT] Defaulting to single-GPU dynamic loading strategy.")
+            self.retriever_device = "cuda"
+            self.reranker_device = "cuda"
+            self.vl_gpus = list(range(torch.cuda.device_count()))
+            self.vl_main_device = "cuda"
+        # -----------------------------
+
         
         print(f"[INIT] Loading local retriever model from: {retriever_model_path}")
         self.retriever_model_path = pathlib.Path(retriever_model_path).resolve()
@@ -96,12 +112,18 @@ class MultimodalRAG:
             start_time = time.time()
             print("[MODEL] Starting retriever model or index loading...")
             
+            model_args = {'index_root': self.index_root}
+            if torch.cuda.is_available():
+                 # byaldi doesn't seem to take device argument directly, so we don't pass it here.
+                 # We will move the model to the correct device after loading.
+                 pass
+
             if os.path.exists(os.path.join(self.index_root, self.index_name)):
                 print(f"[MODEL] Found existing index: {self.index_name}")
                 print(f"[MODEL] Loading index, this may take a few minutes...")
                 self.retriever_model = RAGMultiModalModel.from_index(
                     self.index_name,
-                    index_root=self.index_root
+                    **model_args
                 )
                 print(f"[MODEL] Index loading complete!")
             else:
@@ -109,10 +131,19 @@ class MultimodalRAG:
                 print(f"[MODEL] This may take a few minutes depending on model size and hardware...")
                 self.retriever_model = RAGMultiModalModel.from_pretrained(
                     self.retriever_model_path,
-                    index_root=self.index_root
+                    **model_args
                 )
                 print(f"[MODEL] Retriever Model loading complete!")
-            
+
+            # The ColPaliModel object itself doesn't have a .to() method.
+            # We need to access its internal torch.nn.Module, which is often also named 'model'.
+            if hasattr(self.retriever_model, 'model') and self.retriever_model.model is not None:
+                if hasattr(self.retriever_model.model, 'model'):
+                    self.retriever_model.model.model.to(self.retriever_device)
+                    print(f"[MODEL] Retriever model's internal torch model moved to {self.retriever_device}")
+                else:
+                    print("[WARN] Could not find an internal '.model' attribute on the ColPaliModel to move to a specific device.")
+
             elapsed_time = time.time() - start_time
             print(f"[MODEL] Retriever model loading complete! Time elapsed: {elapsed_time:.2f} seconds")
             return True
@@ -126,8 +157,8 @@ class MultimodalRAG:
             return True
         try:
             start_time = time.time()
-            print(f"[MODEL] Loading reranker model from: {self.reranker_model_path}")
-            self.reranker_model = Reranker(self.reranker_model_path)
+            print(f"[MODEL] Loading reranker model from: {self.reranker_model_path} to {self.reranker_device}")
+            self.reranker_model = Reranker(self.reranker_model_path, device=self.reranker_device)
             print(f"[MODEL] Reranker model loading complete!")
             elapsed_time = time.time() - start_time
             print(f"[MODEL] Reranker model loading complete! Time elapsed: {elapsed_time:.2f} seconds")
@@ -193,9 +224,10 @@ class MultimodalRAG:
             
             max_mem_per_gpu = "24GiB"  # Modify it according to your GPU setting. On an A100, 80 GiB is sufficient to load on a single GPU.
 
+            print(f"[MODEL] Distributing VL model across GPUs: {self.vl_gpus}")
             device_map = infer_auto_device_map(
                 model,
-                max_memory={i: max_mem_per_gpu for i in range(torch.cuda.device_count())},
+                max_memory={i: max_mem_per_gpu for i in self.vl_gpus},
                 no_split_module_classes=["Bagel", "Qwen2MoTDecoderLayer"],
             )
             print(device_map)
@@ -210,15 +242,13 @@ class MultimodalRAG:
                 'vit_pos_embed'
             ]
 
-            if torch.cuda.device_count() == 1:
-                first_device = device_map.get(same_device_modules[0], "cuda:0")
+            if len(self.vl_gpus) == 1:
+                first_device = f"cuda:{self.vl_gpus[0]}"
                 for k in same_device_modules:
-                    if k in device_map:
-                        device_map[k] = first_device
-                    else:
-                        device_map[k] = "cuda:0"
+                    device_map[k] = first_device
             else:
-                first_device = device_map.get(same_device_modules[0])
+                # If using multiple GPUs for VL model, place these small modules on the first designated VL GPU
+                first_device = self.vl_main_device
                 for k in same_device_modules:
                     if k in device_map:
                         device_map[k] = first_device
@@ -283,7 +313,8 @@ class MultimodalRAG:
                 print(f"[INDEX] Reloading model to ensure clean state...")
                 self.retriever_model = RAGMultiModalModel.from_pretrained(
                     self.retriever_model_path,
-                    index_root=self.index_root
+                    index_root=self.index_root,
+                    device_map={'': self.retriever_device}
                 )
             
             input_path_obj = pathlib.Path(input_path + '/image/')
@@ -480,16 +511,22 @@ class MultimodalRAG:
         try:
             start_time = time.time()
 
-            # The user's query is the main prompt. We append image placeholders.
-            # The prompt format `A man <img><|image_1|></img> and a woman <img><|image_2|></img>...`
-            # suggests placeholders can be interleaved. A simple approach is to append them.
+            # Create a chat-style prompt for multiple images
             image_placeholders = " ".join([f"<img><|image_{i+1}|></img>" for i in range(len(images))])
-            prompt_with_placeholders = f"{prompt} {image_placeholders}"
+            
+            # The prompt is constructed to give context and instructions to the model.
+            chat_prompt = (
+                "You are an expert in RTL circuit optimization. Below are several images related to a circuit. "
+                "Please analyze all of them and provide a comprehensive, consolidated answer to the user's question.\n\n"
+                f"Images: {image_placeholders}\n\n"
+                f"User Question: {prompt}\n\n"
+                "Assistant:"
+            )
 
             print(f"[VLMODEL] Generating answer for prompt: \"{prompt}\" with {len(images)} images.")
             
             # Create the input list for interleave_inference
-            input_list = images + [prompt_with_placeholders]
+            input_list = images + [chat_prompt]
 
             inference_hyper = dict(
                 max_think_token_n=1000,
@@ -528,6 +565,13 @@ class MultimodalRAG:
 
         try:
             start_time = time.time()
+            
+            # Create a chat-style prompt
+            chat_prompt = (
+                "You are an expert in RTL circuit optimization. Please analyze the provided image and give a detailed answer to the following question.\n\n"
+                f"User: {prompt}\n\n"
+                "Assistant:"
+            )
             print(f"[VLMODEL] Generating answer for prompt: \"{prompt}\"")
 
             # The hyperparameters are from the "Understanding" section of the notebook
@@ -537,7 +581,7 @@ class MultimodalRAG:
                 # text_temperature=0.3,
             )
             
-            output_dict = self.vl_model(image=image, text=prompt, understanding_output=True, **inference_hyper)
+            output_dict = self.vl_model(image=image, text=chat_prompt, understanding_output=True, **inference_hyper)
             
             answer = output_dict['text']
             
@@ -588,7 +632,7 @@ if __name__ == "__main__":
     parser.add_argument('--reranker_model_path', type=str, default='../models/MonoQwen2-VL-v0.1', help='Path to the reranker model')
     parser.add_argument('--vl_model_path', type=str, default='../models/BAGEL-7B-MoT', help='Path to the Vision-Language model')
     parser.add_argument('--input_path', type=str, default='../data/', help='Path to the directory containing documents or a single document file')
-    parser.add_argument('--query', type=str, help='Query to search for')
+    # parser.add_argument('--query', type=str, help='Query to search for')
     parser.add_argument('--image_path', type=str, default='../data/image/', help='Path to an image file for context')
     parser.add_argument('--task', type=str, choices=['create_index', 'search', 'rerank', 'generate_answer'], default='search', help='Task to perform')
     parser.add_argument('--k', type=int, default=5, help='Number of documents to retrieve')
@@ -637,77 +681,118 @@ if __name__ == "__main__":
                 else:
                     print(f" Reranked item with score: {res['score']} but missing original data.")
     elif args.task == 'generate_answer':
-        if not args.query:
-            print("Please provide a query for answer generation.")
-        else:
-            print("[GENERATE_ANSWER] Searching for relevant documents...")
+        # --- Model Loading Strategy based on GPU count ---
+        is_multi_gpu_resident = torch.cuda.device_count() >= 4
+
+        if is_multi_gpu_resident:
+            print("[SYSTEM] Multi-GPU resident mode: Loading all models to designated GPUs...")
             rag.load_retriever_model()
-            search_results = rag.search(args.query, k=10)
-            rag.unload_retriever_model()
+            rag.load_reranker_model()
+            rag.load_vl_model()
+            print("[SYSTEM] All models loaded. Starting interactive session. Type 'exit' or 'quit' to end.")
+        else:
+            print("[SYSTEM] Dynamic loading mode: Loading retriever model for interactive session...")
+            rag.load_retriever_model()
+            print("[SYSTEM] Retriever model loaded. Starting interactive session. Type 'exit' or 'quit' to end.")
+
+        current_query = args.query
+
+        while True:
+            if not current_query:
+                current_query = input("\nEnter your question: ")
+
+            if current_query.lower() in ['exit', 'quit']:
+                print("[SYSTEM] Exiting chat session.")
+                break
+            
+            print(f"\n[USER] Query: {current_query}")
+
+            print("[GENERATE_ANSWER] Searching for relevant documents...")
+            search_results = rag.search(current_query, k=10)
             
             if not search_results:
                 print("[GENERATE_ANSWER] No documents found for the query.")
-            else:
-                print("[GENERATE_ANSWER] Reranking search results to find the best image...")
+                current_query = None
+                continue
+
+            if not is_multi_gpu_resident:
+                print("[GENERATE_ANSWER] Loading reranker model and processing results...")
                 rag.load_reranker_model()
-                reranked_results = rag.rerank(args.query, search_results, k=args.k)
+            
+            reranked_results = rag.rerank(current_query, search_results, k=args.k)
+
+            if not is_multi_gpu_resident:
                 rag.unload_reranker_model()
-                
-                if not reranked_results:
-                    print("[GENERATE_ANSWER] Reranking failed or returned no results.")
-                else:
+            
+            if not reranked_results:
+                print("[GENERATE_ANSWER] Reranking failed or returned no results.")
+                current_query = None
+                continue
+
+            try:
+                if not is_multi_gpu_resident:
+                    print("[GENERATE_ANSWER] Loading VL model for answer generation...")
+                    rag.load_vl_model()
+
+                if args.k == 1:
                     top_result = reranked_results[0]
                     image_name = top_result.get('image_name')
-
                     if not image_name or image_name == "N/A":
                         print("[GENERATE_ANSWER] Reranking did not yield a valid image name.")
+                        answer = "Could not find a relevant image to answer the question."
                     else:
-                        try:
-                            rag.load_vl_model()
-                            
-                            # For single image generation, use the top result
-                            if args.k == 1:
-                                image_path = os.path.join(rag.image_path, image_name)
-                                print(f"[GENERATE_ANSWER] Using image '{image_name}' for answer generation.")
-                                image = Image.open(image_path)
-                                answer = rag.generate_answer(image, args.query)
-                            else: # For multi-image generation
-                                images_to_use = []
-                                image_names = []
-                                for res in reranked_results:
-                                    img_name = res.get('image_name')
-                                    if img_name and img_name != "N/A":
-                                        image_path = os.path.join(rag.image_path, img_name)
-                                        images_to_use.append(Image.open(image_path))
-                                        image_names.append(img_name)
-                                
-                                if images_to_use:
-                                    print(f"[GENERATE_ANSWER] Using {len(images_to_use)} images for answer generation: {image_names}")
-                                    answer = rag.generate_answer_from_images(images_to_use, args.query)
-                                else:
-                                    answer = "[GENERATE_ANSWER] No valid images found in reranked results to generate an answer."
+                        image_path = os.path.join(rag.image_path, image_name)
+                        print(f"[GENERATE_ANSWER] Using image '{image_name}' for answer generation.")
+                        image = Image.open(image_path)
+                        answer = rag.generate_answer(image, current_query)
+                else: # For multi-image generation
+                    images_to_use = []
+                    image_names = []
+                    for res in reranked_results:
+                        img_name = res.get('image_name')
+                        if img_name and img_name != "N/A":
+                            image_path = os.path.join(rag.image_path, img_name)
+                            images_to_use.append(Image.open(image_path))
+                            image_names.append(img_name)
+                    
+                    if images_to_use:
+                        print(f"[GENERATE_ANSWER] Using {len(images_to_use)} images for answer generation: {image_names}")
+                        answer = rag.generate_answer_from_images(images_to_use, current_query)
+                    else:
+                        answer = "[GENERATE_ANSWER] No valid images found in reranked results to generate an answer."
+                
+                if not is_multi_gpu_resident:
+                    rag.unload_vl_model()
 
-                            rag.unload_vl_model()
-                            print("\n--- Generated Answer ---")
-                            print(answer)
-                            print("------------------------")
-                        except FileNotFoundError:
-                            print(f"Error: Reranked image file not found at {image_path}")
-                        except Exception as e:
-                            print(f"An error occurred during answer generation: {e}")
+                print("\n--- Generated Answer ---")
+                print(answer)
+                print("------------------------")
+
+            except FileNotFoundError as e:
+                print(f"Error: Reranked image file not found: {e}")
+            except Exception as e:
+                print(f"An error occurred during answer generation: {e}")
+            
+            current_query = None # Reset for next loop to get input
+
+        # Unload models after the loop
+        rag.unload_retriever_model()
+        if is_multi_gpu_resident:
+            rag.unload_reranker_model()
+            rag.unload_vl_model()
 
     # Example usage:
     # 1. Create Index:
-    # python main.py --task create_index --input_path ../data/pdf/ --overwrite
+    # python main.py --task create_index --input_path ../data/ --overwrite
     #
     # 2. Search:
-    # python main.py --task search --query "How to optimize LUT?" --input_path ../index/optimize_rules/
+    # python main.py --task search --query "How to optimize LUT?" 
     #
     # 3. Rerank:
-    # python main.py --task rerank --query "How to optimize LUT?" --input_path ../index/rtl_optimize_rules/ --k 3
+    # python main.py --task rerank --query "How to optimize LUT?"  --k 3
     #
     # 4. Generate Answer (single image):
-    # python main.py --task generate_answer --query "How to optimize this circuit?" --k 1
+    # python main.py --task generate_answer  --k 1
     #
     # 5. Generate Answer (multiple images):
-    # python main.py --task generate_answer --query "How to optimize this circuit based on these images?" --k 3
+    # python main.py --task generate_answer --k 3
