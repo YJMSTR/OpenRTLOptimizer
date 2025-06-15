@@ -704,16 +704,29 @@ if __name__ == "__main__":
 
         while True:
             if not current_query:
-                current_query = input("\nEnter your question: ")
+                print("\nEnter your multi-line question (Press Ctrl+D on a new line when you are done):")
+                lines = []
+                try:
+                    while True:
+                        lines.append(input())
+                except EOFError:
+                    # Add a newline for cleaner terminal output after Ctrl-D
+                    print()
+                current_query = "\n".join(lines)
 
-            if current_query.lower() in ['exit', 'quit']:
+            if current_query.strip().lower() in ['exit', 'quit']:
                 print("[SYSTEM] Exiting chat session.")
                 break
+            
+            if not current_query.strip():
+                print("[SYSTEM] No input received. Please try again or type 'exit' to quit.")
+                current_query = None # Reset for next loop
+                continue
             
             print(f"\n[USER] Query: {current_query}")
 
             print("[GENERATE_ANSWER] Searching for relevant documents...")
-            search_results = rag.search(current_query, k=10)
+            search_results = rag.search(current_query, k=30)
             
             if not search_results:
                 print("[GENERATE_ANSWER] No documents found for the query.")
